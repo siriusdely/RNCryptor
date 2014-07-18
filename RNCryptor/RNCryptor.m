@@ -27,6 +27,7 @@
 #import "RNCryptor.h"
 #import "RNCryptor+Private.h"
 #import <Security/SecRandom.h>
+#import <fcntl.h>
 
 extern int SecRandomCopyBytes(SecRandomRef rnd, size_t count, uint8_t *bytes) __attribute__((weak_import));
 extern int
@@ -37,7 +38,7 @@ CCKeyDerivationPBKDF( CCPBKDFAlgorithm algorithm, const char *password, size_t p
 
 
 NSString *const kRNCryptorErrorDomain = @"net.robnapier.RNCryptManager";
-const uint8_t kRNCryptorFileVersion = 2;
+const uint8_t kRNCryptorFileVersion = 3;
 
 // TODO: This is a slightly expensive solution, but it's convenient. May want to create a "walkable" data object
 @implementation NSMutableData (RNCryptor)
@@ -138,7 +139,9 @@ getPRFhlen(CCPseudoRandomAlgorithm prf)
 		case kCCPRFHmacAlgSHA256:	return kCCPRFHmacAlgSHA256hlen;
 		case kCCPRFHmacAlgSHA384:	return kCCPRFHmacAlgSHA384hlen;
 		case kCCPRFHmacAlgSHA512:	return kCCPRFHmacAlgSHA512hlen;
-		default: return 0;
+		default:
+      NSCAssert(NO, @"Unknown prf: %d", prf);
+      return 1;
 	}
 }
 
@@ -164,7 +167,7 @@ PRF(CCPseudoRandomAlgorithm prf, const char *password, size_t passwordLen, u_int
 	}
 }
 
-int
+static int
 RN_CCKeyDerivationPBKDF( CCPBKDFAlgorithm algorithm, const char *password, size_t passwordLen,
                      const uint8_t *salt, size_t saltLen,
                      CCPseudoRandomAlgorithm prf, uint rounds,
@@ -265,32 +268,35 @@ RN_CCKeyDerivationPBKDF( CCPBKDFAlgorithm algorithm, const char *password, size_
 {
   NSMutableData *derivedKey = [NSMutableData dataWithLength:keySettings.keySize];
 
-  int result;
-  if (CCKeyDerivationPBKDF != NULL) {
-    result = CCKeyDerivationPBKDF(keySettings.PBKDFAlgorithm,         // algorithm
-                                  password.UTF8String,                // password
-                                  password.length,                    // passwordLength
-                                  salt.bytes,                         // salt
-                                  salt.length,                        // saltLen
-                                  keySettings.PRF,                    // PRF
-                                  keySettings.rounds,                 // rounds
-                                  derivedKey.mutableBytes,            // derivedKey
-                                  derivedKey.length);                 // derivedKeyLen
+  // See Issue #77. V2 incorrectly calculated key for multi-byte characters.
+  NSData *passwordData;
+  if (keySettings.hasV2Password) {
+    passwordData = [NSData dataWithBytes:[password UTF8String] length:[password length]];
   }
   else {
-    result = RN_CCKeyDerivationPBKDF(keySettings.PBKDFAlgorithm,         // algorithm
-                                     password.UTF8String,                // password
-                                     password.length,                    // passwordLength
-                                     salt.bytes,                         // salt
-                                     salt.length,                        // saltLen
-                                     keySettings.PRF,                    // PRF
-                                     keySettings.rounds,                 // rounds
-                                     derivedKey.mutableBytes,            // derivedKey
-                                     derivedKey.length);                 // derivedKeyLen
+    passwordData = [password dataUsingEncoding:NSUTF8StringEncoding];
   }
 
+  // Use the built-in PBKDF2 if it's available. Otherwise, we have our own. Hello crazy function pointer.
+  int result;
+  int (*PBKDF)(CCPBKDFAlgorithm algorithm, const char *password, size_t passwordLen,
+               const uint8_t *salt, size_t saltLen,
+               CCPseudoRandomAlgorithm prf, uint rounds,
+               uint8_t *derivedKey, size_t derivedKeyLen);
+
+  PBKDF = CCKeyDerivationPBKDF ?: RN_CCKeyDerivationPBKDF;
+
+  result = PBKDF(keySettings.PBKDFAlgorithm,         // algorithm
+                 passwordData.bytes,                 // password
+                 passwordData.length,                // passwordLength
+                 salt.bytes,                         // salt
+                 salt.length,                        // saltLen
+                 keySettings.PRF,                    // PRF
+                 keySettings.rounds,                 // rounds
+                 derivedKey.mutableBytes,            // derivedKey
+                 derivedKey.length);                 // derivedKeyLen
+
   // Do not log password here
-  // TODO: Is is safe to assert here? We read salt from a file (but salt.length is internal).
   NSAssert(result == kCCSuccess, @"Unable to create AES key for password: %d", result);
 
   return derivedKey;
@@ -321,7 +327,7 @@ RN_CCKeyDerivationPBKDF( CCPBKDFAlgorithm algorithm, const char *password, size_
  *
  * @APPLE_LICENSE_HEADER_END@
  */
-int RN_SecRandomCopyBytes(void *rnd, size_t count, uint8_t *bytes) {
+static int RN_SecRandomCopyBytes(void *rnd, size_t count, uint8_t *bytes) {
   static int kSecRandomFD;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
@@ -369,12 +375,8 @@ int RN_SecRandomCopyBytes(void *rnd, size_t count, uint8_t *bytes) {
   NSParameterAssert(handler);
   self = [super init];
   if (self) {
-      NSString *responseQueueName = [@"net.robnapier.response." stringByAppendingString:NSStringFromClass([self class])];
-      _responseQueue = dispatch_queue_create([responseQueueName UTF8String], NULL);
-
-#if !OS_OBJECT_USE_OBJC
-    dispatch_retain(_responseQueue);
-#endif
+    NSString *responseQueueName = [@"net.robnapier.response." stringByAppendingString:NSStringFromClass([self class])];
+    _responseQueue = dispatch_queue_create([responseQueueName UTF8String], NULL);
 
     NSString *queueName = [@"net.robnapier." stringByAppendingString:NSStringFromClass([self class])];
     _queue = dispatch_queue_create([queueName UTF8String], DISPATCH_QUEUE_SERIAL);
